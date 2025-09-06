@@ -113,7 +113,7 @@ jobs:
 
     - name: SonarQube Analysis
       if: ${{ github.ref == 'refs/heads/main' || github.base_ref == 'main' }}
-      uses: SonarSource/sonarqube-scan-action@5.3.1
+      uses: SonarSource/sonarqube-scan-action@v5.3.1
       env:
         SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
       with:
