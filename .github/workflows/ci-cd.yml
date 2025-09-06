@@ -109,11 +109,11 @@ jobs:
       uses: gitleaks/gitleaks-action@v2
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+        #GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
 
     - name: SonarQube Analysis
       if: ${{ github.ref == 'refs/heads/main' || github.base_ref == 'main' }}
-      uses: sonarqube-quality-gate-action@master
+      uses: SonarSource/sonarqube-scan-action@5.3.1
       env:
         SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
       with:
