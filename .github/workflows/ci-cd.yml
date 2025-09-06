@@ -6,28 +6,31 @@ on:
   pull_request:
     branches: [ "main", "develop" ]
     types: [opened, synchronize, reopened]
+  # Strategy to prevent duplicate runs:
+  # - Feature branch pushes: run validation jobs but skip PR comments
+  # - PR events: run all jobs including PR comments
+  # - Use github.event_name to differentiate behavior
 
 env:
   PYTHON_VERSION: '3.11'
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
   cancel-in-progress: true
 
 jobs:
-  devsecops-validation:
-    name: DevSecOps Validation
+  code-quality:
+    name: Code Quality & Formatting
     runs-on: ubuntu-latest
     continue-on-error: true
     outputs:
-      coverage: ${{ steps.tests.outputs.coverage }}
-      security-status: ${{ steps.deps-scan.outputs.pip-audit-status == 'passed' && steps.deps-scan.outputs.safety-status == 'passed' && steps.sast-scan.outputs.bandit-status == 'passed' && 'passed' || 'failed' }}
+      formatting-status: ${{ steps.formatting.outcome }}
+      linting-status: ${{ steps.linting.outcome }}
+      typing-status: ${{ steps.typing.outcome }}
     
     steps:
     - name: Checkout Code
       uses: actions/checkout@v4
-      with:
-        fetch-depth: 0  # Full history for SonarQube
 
     - name: Set up Python
       uses: actions/setup-python@v4
@@ -40,51 +43,138 @@ jobs:
         python -m pip install --upgrade pip
         pip install -r requirements.txt
         pip install -r requirements-dev.txt
-        
-        # Install additional security tools
-        pip install bandit safety pip-audit flake8 black isort mypy pytest-cov
+        pip install black isort flake8 mypy
 
     - name: Code Formatting Check
+      id: formatting
       continue-on-error: true
       run: |
         echo "::group::Black Code Formatting"
-        black --check --diff .
+        black --check --diff . || BLACK_EXIT=$?
         echo "::endgroup::"
         
         echo "::group::Import Sorting"
-        isort --check-only --diff .
+        isort --check-only --diff . || ISORT_EXIT=$?
         echo "::endgroup::"
+        
+        # Update step summary
+        echo "## Code Formatting Results" >> $GITHUB_STEP_SUMMARY
+        echo "| Check | Status |" >> $GITHUB_STEP_SUMMARY
+        echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+        echo "| Black Formatting | $([[ ${BLACK_EXIT:-0} -eq 0 ]] && echo 'PASSED' || echo 'FAILED') |" >> $GITHUB_STEP_SUMMARY
+        echo "| Import Sorting | $([[ ${ISORT_EXIT:-0} -eq 0 ]] && echo 'PASSED' || echo 'FAILED') |" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
 
     - name: Code Quality Check
+      id: linting
       continue-on-error: true
       run: |
         echo "::group::Flake8 Linting"
-        flake8 . --count --exit-zero --max-complexity=10 --max-line-length=88 --statistics
+        flake8 . --count --max-complexity=10 --max-line-length=88 --statistics || FLAKE8_EXIT=$?
         echo "::endgroup::"
+        
+        # Update step summary
+        echo "## Code Quality Results" >> $GITHUB_STEP_SUMMARY
+        echo "| Check | Status |" >> $GITHUB_STEP_SUMMARY
+        echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+        echo "| Flake8 Linting | $([[ ${FLAKE8_EXIT:-0} -eq 0 ]] && echo 'PASSED' || echo 'FAILED') |" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
 
     - name: Type Checking
+      id: typing
       continue-on-error: true
       run: |
         echo "::group::MyPy Type Checking"
-        mypy . --ignore-missing-imports || echo "Type checking completed with warnings"
+        mypy . --ignore-missing-imports || MYPY_EXIT=$?
         echo "::endgroup::"
+        
+        # Update step summary
+        echo "## Type Checking Results" >> $GITHUB_STEP_SUMMARY
+        echo "| Check | Status |" >> $GITHUB_STEP_SUMMARY
+        echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+        echo "| MyPy Type Analysis | $([[ ${MYPY_EXIT:-0} -eq 0 ]] && echo 'PASSED' || echo 'FAILED') |" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+
+  testing:
+    name: Testing & Coverage
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    outputs:
+      coverage: ${{ steps.tests.outputs.coverage }}
+      test-status: ${{ steps.tests.outcome }}
+    
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+        cache: 'pip'
+
+    - name: Install Dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install -r requirements-dev.txt
+        pip install pytest-cov
 
     - name: Run Tests with Coverage
       id: tests
       continue-on-error: true
       run: |
         echo "::group::Running Tests"
-        pytest --cov=src --cov-report=xml --cov-report=html --cov-report=term-missing
+        pytest --cov=src --cov-report=xml --cov-report=html --cov-report=term-missing || PYTEST_EXIT=$?
         echo "::endgroup::"
         
-        # Extract coverage percentage
+        # Extract coverage percentage and test results
         COVERAGE=$(python -c "import xml.etree.ElementTree as ET; tree = ET.parse('coverage.xml'); root = tree.getroot(); print(f'{float(root.attrib[\"line-rate\"]) * 100:.1f}')" 2>/dev/null || echo "N/A")
         echo "coverage=$COVERAGE" >> $GITHUB_OUTPUT
         
-        # Test results
+        # Generate comprehensive test summary
+        echo "## Testing Results" >> $GITHUB_STEP_SUMMARY
+        echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
+        echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+        echo "| Test Execution | $([[ ${PYTEST_EXIT:-0} -eq 0 ]] && echo 'PASSED' || echo 'FAILED') |" >> $GITHUB_STEP_SUMMARY
+        echo "| Code Coverage | ${COVERAGE}% |" >> $GITHUB_STEP_SUMMARY
+        
+        if [[ ${PYTEST_EXIT:-0} -ne 0 ]]; then
+          echo "| Test Failures | Yes - Check logs for details |" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "| Test Failures | None |" >> $GITHUB_STEP_SUMMARY
+        fi
+        
         echo "" >> $GITHUB_STEP_SUMMARY
-        echo "### Test Status: ✅ Passed" >> $GITHUB_STEP_SUMMARY
-        echo "Coverage: **$COVERAGE%**" >> $GITHUB_STEP_SUMMARY
+
+  security-scans:
+    name: Security Analysis
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    outputs:
+      pip-audit-status: ${{ steps.deps-scan.outputs.pip-audit-status }}
+      safety-status: ${{ steps.deps-scan.outputs.safety-status }}
+      bandit-status: ${{ steps.sast-scan.outputs.bandit-status }}
+      secret-scan-status: ${{ steps.secret-scan.outcome }}
+    
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0  # Full history for secret scanning
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+        cache: 'pip'
+
+    - name: Install Dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install -r requirements-dev.txt
+        pip install bandit safety pip-audit
 
     - name: Dependency Security Scan
       id: deps-scan
@@ -103,6 +193,14 @@ jobs:
         # Set outputs
         echo "pip-audit-status=$([[ $PIPAUDIT_EXIT -eq 0 ]] && echo 'passed' || echo 'failed')" >> $GITHUB_OUTPUT
         echo "safety-status=$([[ $SAFETY_EXIT -eq 0 ]] && echo 'passed' || echo 'failed')" >> $GITHUB_OUTPUT
+        
+        # Update step summary
+        echo "## Dependency Security Scan Results" >> $GITHUB_STEP_SUMMARY
+        echo "| Tool | Status |" >> $GITHUB_STEP_SUMMARY
+        echo "|------|--------|" >> $GITHUB_STEP_SUMMARY
+        echo "| Pip Audit | $([[ $PIPAUDIT_EXIT -eq 0 ]] && echo 'PASSED' || echo 'FAILED') |" >> $GITHUB_STEP_SUMMARY
+        echo "| Safety Check | $([[ $SAFETY_EXIT -eq 0 ]] && echo 'PASSED' || echo 'FAILED') |" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
 
     - name: SAST Security Scan
       id: sast-scan
@@ -115,41 +213,103 @@ jobs:
         echo "::endgroup::"
         
         echo "bandit-status=$([[ $BANDIT_EXIT -eq 0 ]] && echo 'passed' || echo 'failed')" >> $GITHUB_OUTPUT
+        
+        # Update step summary
+        echo "## SAST Security Scan Results" >> $GITHUB_STEP_SUMMARY
+        echo "| Tool | Status |" >> $GITHUB_STEP_SUMMARY
+        echo "|------|--------|" >> $GITHUB_STEP_SUMMARY
+        echo "| Bandit Analysis | $([[ $BANDIT_EXIT -eq 0 ]] && echo 'PASSED' || echo 'FAILED') |" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
 
     - name: Secret Scanning
+      id: secret-scan
       continue-on-error: true
       uses: gitleaks/gitleaks-action@v2
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        #GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+
+    - name: Security Scan Summary
+      if: always()
+      run: |
+        echo "## Security Analysis Summary" >> $GITHUB_STEP_SUMMARY
+        echo "| Scan Type | Status |" >> $GITHUB_STEP_SUMMARY
+        echo "|-----------|--------|" >> $GITHUB_STEP_SUMMARY
+        echo "| Dependency Audit | ${{ steps.deps-scan.outputs.pip-audit-status == 'passed' && 'PASSED' || 'FAILED' }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| Safety Check | ${{ steps.deps-scan.outputs.safety-status == 'passed' && 'PASSED' || 'FAILED' }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| SAST Analysis | ${{ steps.sast-scan.outputs.bandit-status == 'passed' && 'PASSED' || 'FAILED' }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| Secret Detection | ${{ steps.secret-scan.outcome == 'success' && 'PASSED' || 'FAILED' }} |" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+
+  sonarqube-analysis:
+    name: SonarQube Analysis
+    runs-on: ubuntu-latest
+    if: ${{ github.ref == 'refs/heads/main' || github.base_ref == 'main' }}
+    needs: [testing]
+    continue-on-error: true
+    
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0  # Full history for SonarQube
+
+    - name: Download Coverage Reports
+      uses: actions/download-artifact@v4
+      with:
+        name: coverage-reports
 
     - name: SonarQube Analysis
-      if: ${{ github.ref == 'refs/heads/main' || github.base_ref == 'main' }}
-      continue-on-error: true
       uses: SonarSource/sonarqube-scan-action@v5.3.1
       env:
         SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
       with:
         scanMetadataReportFile: target/sonar/report-task.txt
 
+  pr-comment:
+    name: PR Comment with Results
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' && github.base_ref != 'main'
+    needs: [code-quality, testing, security-scans]
+    permissions:
+      pull-requests: write
+      contents: read
+    
+    steps:
     - name: Comment PR with Results
-      if: github.event_name == 'pull_request' && github.base_ref != 'main'
       uses: peter-evans/create-or-update-comment@v4
       with:
         token: ${{ secrets.GITHUB_TOKEN }}
         issue-number: ${{ github.event.pull_request.number }}
         body: |
-          ## 🔍 Task Management API - DevSecOps Results
+          ## Task Management API - DevSecOps Pipeline Results
           
-          ### 📊 Test Coverage
-          Coverage: **${{ steps.tests.outputs.coverage }}%**
+          ### Test Coverage
+          | Metric | Value |
+          |--------|-------|
+          | Coverage Percentage | **${{ needs.testing.outputs.coverage }}%** |
           
-          ### 🔒 Security Scans
-          - Dependency Scan (pip-audit): ${{ steps.deps-scan.outputs.pip-audit-status == 'passed' && '✅ Passed' || '❌ Failed' }}
-          - Dependency Scan (safety): ${{ steps.deps-scan.outputs.safety-status == 'passed' && '✅ Passed' || '❌ Failed' }}
-          - SAST Analysis (bandit): ${{ steps.sast-scan.outputs.bandit-status == 'passed' && '✅ Passed' || '❌ Failed' }}
-          - Secret Scanning: ✅ Completed
+          ### Code Quality Analysis
+          | Check | Status |
+          |-------|--------|
+          | Code Formatting | ${{ needs.code-quality.outputs.formatting-status == 'success' && 'PASSED' || 'FAILED' }} |
+          | Code Linting | ${{ needs.code-quality.outputs.linting-status == 'success' && 'PASSED' || 'FAILED' }} |
+          | Type Checking | ${{ needs.code-quality.outputs.typing-status == 'success' && 'PASSED' || 'FAILED' }} |
           
-          **Overall Status**: ${{ job.status == 'success' && '✅ All checks passed' || '❌ Some checks failed' }}
+          ### Testing Results
+          | Test Type | Status |
+          |-----------|--------|
+          | Unit Tests | ${{ needs.testing.outputs.test-status == 'success' && 'PASSED' || 'FAILED' }} |
           
-          <sub>Updated: ${{ github.event.pull_request.head.sha }}</sub>
+          ### Security Analysis
+          | Scan Type | Status |
+          |-----------|--------|
+          | Dependency Audit (pip-audit) | ${{ needs.security-scans.outputs.pip-audit-status == 'passed' && 'PASSED' || 'FAILED' }} |
+          | Dependency Safety Check | ${{ needs.security-scans.outputs.safety-status == 'passed' && 'PASSED' || 'FAILED' }} |
+          | SAST Analysis (bandit) | ${{ needs.security-scans.outputs.bandit-status == 'passed' && 'PASSED' || 'FAILED' }} |
+          | Secret Detection | ${{ needs.security-scans.outputs.secret-scan-status == 'success' && 'PASSED' || 'FAILED' }} |
+          
+          ### Pipeline Summary
+          **Overall Status**: ${{ needs.code-quality.result == 'success' && needs.testing.result == 'success' && needs.security-scans.result == 'success' && 'ALL CHECKS PASSED' || 'SOME CHECKS FAILED' }}
+          
+          ---
+          *Pipeline executed for commit: ${{ github.event.pull_request.head.sha }}*
