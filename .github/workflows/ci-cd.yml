@@ -6,16 +6,16 @@ on:
   pull_request:
     branches: [ "main", "develop" ]
     types: [opened, synchronize, reopened]
-  # Strategy to prevent duplicate runs:
-  # - Feature branch pushes: run validation jobs but skip PR comments
-  # - PR events: run all jobs including PR comments
-  # - Use github.event_name to differentiate behavior
+  # Strategy to handle duplicate runs:
+  # - Both push and PR events are needed for different scenarios
+  # - Concurrency group ensures PR events take precedence over push events
+  # - When PR exists: PR event cancels any running push event
 
 env:
   PYTHON_VERSION: '3.11'
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  group: ci-${{ github.head_ref || github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -56,14 +56,6 @@ jobs:
         echo "::group::Import Sorting"
         isort --check-only --diff . || ISORT_EXIT=$?
         echo "::endgroup::"
-        
-        # Update step summary
-        echo "## Code Formatting Results" >> $GITHUB_STEP_SUMMARY
-        echo "| Check | Status |" >> $GITHUB_STEP_SUMMARY
-        echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
-        echo "| Black Formatting | $([[ ${BLACK_EXIT:-0} -eq 0 ]] && echo 'PASSED' || echo 'FAILED') |" >> $GITHUB_STEP_SUMMARY
-        echo "| Import Sorting | $([[ ${ISORT_EXIT:-0} -eq 0 ]] && echo 'PASSED' || echo 'FAILED') |" >> $GITHUB_STEP_SUMMARY
-        echo "" >> $GITHUB_STEP_SUMMARY
 
     - name: Code Quality Check
       id: linting
@@ -72,13 +64,6 @@ jobs:
         echo "::group::Flake8 Linting"
         flake8 . --count --max-complexity=10 --max-line-length=88 --statistics || FLAKE8_EXIT=$?
         echo "::endgroup::"
-        
-        # Update step summary
-        echo "## Code Quality Results" >> $GITHUB_STEP_SUMMARY
-        echo "| Check | Status |" >> $GITHUB_STEP_SUMMARY
-        echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
-        echo "| Flake8 Linting | $([[ ${FLAKE8_EXIT:-0} -eq 0 ]] && echo 'PASSED' || echo 'FAILED') |" >> $GITHUB_STEP_SUMMARY
-        echo "" >> $GITHUB_STEP_SUMMARY
 
     - name: Type Checking
       id: typing
@@ -87,12 +72,23 @@ jobs:
         echo "::group::MyPy Type Checking"
         mypy . --ignore-missing-imports || MYPY_EXIT=$?
         echo "::endgroup::"
+
+    - name: Code Quality Summary
+      if: always()
+      run: |
+        # Get exit codes from previous steps
+        BLACK_STATUS="${{ steps.formatting.outcome }}"
+        ISORT_STATUS="${{ steps.formatting.outcome }}"
+        FLAKE8_STATUS="${{ steps.linting.outcome }}"
+        MYPY_STATUS="${{ steps.typing.outcome }}"
         
-        # Update step summary
-        echo "## Type Checking Results" >> $GITHUB_STEP_SUMMARY
+        echo "## Code Quality Analysis Results" >> $GITHUB_STEP_SUMMARY
         echo "| Check | Status |" >> $GITHUB_STEP_SUMMARY
         echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
-        echo "| MyPy Type Analysis | $([[ ${MYPY_EXIT:-0} -eq 0 ]] && echo 'PASSED' || echo 'FAILED') |" >> $GITHUB_STEP_SUMMARY
+        echo "| Black Formatting | $([[ $BLACK_STATUS == 'success' ]] && echo 'PASSED' || echo 'FAILED') |" >> $GITHUB_STEP_SUMMARY
+        echo "| Import Sorting | $([[ $ISORT_STATUS == 'success' ]] && echo 'PASSED' || echo 'FAILED') |" >> $GITHUB_STEP_SUMMARY
+        echo "| Flake8 Linting | $([[ $FLAKE8_STATUS == 'success' ]] && echo 'PASSED' || echo 'FAILED') |" >> $GITHUB_STEP_SUMMARY
+        echo "| MyPy Type Analysis | $([[ $MYPY_STATUS == 'success' ]] && echo 'PASSED' || echo 'FAILED') |" >> $GITHUB_STEP_SUMMARY
         echo "" >> $GITHUB_STEP_SUMMARY
 
   testing:
@@ -131,20 +127,19 @@ jobs:
         # Extract coverage percentage and test results
         COVERAGE=$(python -c "import xml.etree.ElementTree as ET; tree = ET.parse('coverage.xml'); root = tree.getroot(); print(f'{float(root.attrib[\"line-rate\"]) * 100:.1f}')" 2>/dev/null || echo "N/A")
         echo "coverage=$COVERAGE" >> $GITHUB_OUTPUT
+
+    - name: Testing Summary
+      if: always()
+      run: |
+        TEST_STATUS="${{ steps.tests.outcome }}"
+        COVERAGE="${{ steps.tests.outputs.coverage }}"
         
-        # Generate comprehensive test summary
         echo "## Testing Results" >> $GITHUB_STEP_SUMMARY
         echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
         echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
-        echo "| Test Execution | $([[ ${PYTEST_EXIT:-0} -eq 0 ]] && echo 'PASSED' || echo 'FAILED') |" >> $GITHUB_STEP_SUMMARY
+        echo "| Test Execution | $([[ $TEST_STATUS == 'success' ]] && echo 'PASSED' || echo 'FAILED') |" >> $GITHUB_STEP_SUMMARY
         echo "| Code Coverage | ${COVERAGE}% |" >> $GITHUB_STEP_SUMMARY
-        
-        if [[ ${PYTEST_EXIT:-0} -ne 0 ]]; then
-          echo "| Test Failures | Yes - Check logs for details |" >> $GITHUB_STEP_SUMMARY
-        else
-          echo "| Test Failures | None |" >> $GITHUB_STEP_SUMMARY
-        fi
-        
+        echo "| Test Failures | $([[ $TEST_STATUS == 'success' ]] && echo 'None' || echo 'Yes - Check logs for details') |" >> $GITHUB_STEP_SUMMARY
         echo "" >> $GITHUB_STEP_SUMMARY
 
   security-scans:
@@ -193,14 +188,6 @@ jobs:
         # Set outputs
         echo "pip-audit-status=$([[ $PIPAUDIT_EXIT -eq 0 ]] && echo 'passed' || echo 'failed')" >> $GITHUB_OUTPUT
         echo "safety-status=$([[ $SAFETY_EXIT -eq 0 ]] && echo 'passed' || echo 'failed')" >> $GITHUB_OUTPUT
-        
-        # Update step summary
-        echo "## Dependency Security Scan Results" >> $GITHUB_STEP_SUMMARY
-        echo "| Tool | Status |" >> $GITHUB_STEP_SUMMARY
-        echo "|------|--------|" >> $GITHUB_STEP_SUMMARY
-        echo "| Pip Audit | $([[ $PIPAUDIT_EXIT -eq 0 ]] && echo 'PASSED' || echo 'FAILED') |" >> $GITHUB_STEP_SUMMARY
-        echo "| Safety Check | $([[ $SAFETY_EXIT -eq 0 ]] && echo 'PASSED' || echo 'FAILED') |" >> $GITHUB_STEP_SUMMARY
-        echo "" >> $GITHUB_STEP_SUMMARY
 
     - name: SAST Security Scan
       id: sast-scan
@@ -213,13 +200,6 @@ jobs:
         echo "::endgroup::"
         
         echo "bandit-status=$([[ $BANDIT_EXIT -eq 0 ]] && echo 'passed' || echo 'failed')" >> $GITHUB_OUTPUT
-        
-        # Update step summary
-        echo "## SAST Security Scan Results" >> $GITHUB_STEP_SUMMARY
-        echo "| Tool | Status |" >> $GITHUB_STEP_SUMMARY
-        echo "|------|--------|" >> $GITHUB_STEP_SUMMARY
-        echo "| Bandit Analysis | $([[ $BANDIT_EXIT -eq 0 ]] && echo 'PASSED' || echo 'FAILED') |" >> $GITHUB_STEP_SUMMARY
-        echo "" >> $GITHUB_STEP_SUMMARY
 
     - name: Secret Scanning
       id: secret-scan
@@ -228,10 +208,10 @@ jobs:
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-    - name: Security Scan Summary
+    - name: Security Analysis Summary
       if: always()
       run: |
-        echo "## Security Analysis Summary" >> $GITHUB_STEP_SUMMARY
+        echo "## Security Analysis Results" >> $GITHUB_STEP_SUMMARY
         echo "| Scan Type | Status |" >> $GITHUB_STEP_SUMMARY
         echo "|-----------|--------|" >> $GITHUB_STEP_SUMMARY
         echo "| Dependency Audit | ${{ steps.deps-scan.outputs.pip-audit-status == 'passed' && 'PASSED' || 'FAILED' }} |" >> $GITHUB_STEP_SUMMARY

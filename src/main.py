@@ -16,14 +16,14 @@ class TaskCreate(BaseModel):
     """Model for creating a new task."""
     title: str = Field(..., min_length=1, max_length=100, description="Task title")
     description: Optional[str] = Field(None, max_length=500, description="Task description")
-    priority: str = Field("medium", regex="^(low|medium|high)$", description="Task priority")
+    priority: str = Field("medium", pattern="^(low|medium|high)$", description="Task priority")
 
 
 class TaskUpdate(BaseModel):
     """Model for updating an existing task."""
     title: Optional[str] = Field(None, min_length=1, max_length=100)
     description: Optional[str] = Field(None, max_length=500)
-    priority: Optional[str] = Field(None, regex="^(low|medium|high)$")
+    priority: Optional[str] = Field(None, pattern="^(low|medium|high)$")
     completed: Optional[bool] = None
 
 
@@ -125,7 +125,7 @@ async def update_task(task_id: str, task_update: TaskUpdate) -> Task:
         )
     
     task = tasks_db[task_id]
-    update_data = task_update.dict(exclude_unset=True)
+    update_data = task_update.model_dump(exclude_unset=True)
     
     for field, value in update_data.items():
         setattr(task, field, value)
