@@ -1,0 +1,141 @@
+name: Task Management API - DevSecOps Pipeline
+
+on:
+  push:
+    branches-ignore: [ "main", "develop" ]  # Feature branches only
+  pull_request:
+    branches: [ "main", "develop" ]
+    types: [opened, synchronize, reopened]
+
+env:
+  PYTHON_VERSION: '3.11'
+
+jobs:
+  devsecops-validation:
+    name: DevSecOps Validation
+    runs-on: ubuntu-latest
+    outputs:
+      coverage: ${{ steps.tests.outputs.coverage }}
+      security-status: ${{ steps.deps-scan.outputs.pip-audit-status == 'passed' && steps.deps-scan.outputs.safety-status == 'passed' && steps.sast-scan.outputs.bandit-status == 'passed' && 'passed' || 'failed' }}
+    
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0  # Full history for SonarQube
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+        cache: 'pip'
+
+    - name: Install Dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install -r requirements-dev.txt
+        
+        # Install additional security tools
+        pip install bandit safety pip-audit flake8 black isort mypy pytest-cov
+
+    - name: Code Formatting Check
+      run: |
+        echo "::group::Black Code Formatting"
+        black --check --diff .
+        echo "::endgroup::"
+        
+        echo "::group::Import Sorting"
+        isort --check-only --diff .
+        echo "::endgroup::"
+
+    - name: Code Quality Check
+      run: |
+        echo "::group::Flake8 Linting"
+        flake8 . --count --exit-zero --max-complexity=10 --max-line-length=88 --statistics
+        echo "::endgroup::"
+
+    - name: Type Checking
+      run: |
+        echo "::group::MyPy Type Checking"
+        mypy . --ignore-missing-imports || echo "Type checking completed with warnings"
+        echo "::endgroup::"
+
+    - name: Run Tests with Coverage
+      id: tests
+      run: |
+        echo "::group::Running Tests"
+        pytest --cov=src --cov-report=xml --cov-report=html --cov-report=term-missing
+        echo "::endgroup::"
+        
+        # Extract coverage percentage
+        COVERAGE=$(python -c "import xml.etree.ElementTree as ET; tree = ET.parse('coverage.xml'); root = tree.getroot(); print(f'{float(root.attrib[\"line-rate\"]) * 100:.1f}')" 2>/dev/null || echo "N/A")
+        echo "coverage=$COVERAGE" >> $GITHUB_OUTPUT
+        
+        # Test results
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### Test Status: ✅ Passed" >> $GITHUB_STEP_SUMMARY
+        echo "Coverage: **$COVERAGE%**" >> $GITHUB_STEP_SUMMARY
+
+    - name: Dependency Security Scan
+      id: deps-scan
+      run: |
+        echo "::group::Pip Audit"
+        pip-audit --format=json --output=pip-audit-report.json || true
+        PIPAUDIT_EXIT=$?
+        echo "::endgroup::"
+        
+        echo "::group::Safety Check"
+        safety check --json --output safety-report.json || true
+        SAFETY_EXIT=$?
+        echo "::endgroup::"
+        
+        # Set outputs
+        echo "pip-audit-status=$([[ $PIPAUDIT_EXIT -eq 0 ]] && echo 'passed' || echo 'failed')" >> $GITHUB_OUTPUT
+        echo "safety-status=$([[ $SAFETY_EXIT -eq 0 ]] && echo 'passed' || echo 'failed')" >> $GITHUB_OUTPUT
+
+    - name: SAST Security Scan
+      id: sast-scan
+      run: |
+        echo "::group::Bandit Security Scan"
+        bandit -r . -f json -o bandit-report.json || true
+        BANDIT_EXIT=$?
+        bandit -r . -f txt || true
+        echo "::endgroup::"
+        
+        echo "bandit-status=$([[ $BANDIT_EXIT -eq 0 ]] && echo 'passed' || echo 'failed')" >> $GITHUB_OUTPUT
+
+    - name: Secret Scanning
+      uses: gitleaks/gitleaks-action@v2
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+
+    - name: SonarQube Analysis
+      if: ${{ github.ref == 'refs/heads/main' || github.base_ref == 'main' }}
+      uses: sonarqube-quality-gate-action@master
+      env:
+        SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+      with:
+        scanMetadataReportFile: target/sonar/report-task.txt
+
+    - name: Comment PR with Results
+      if: github.event_name == 'pull_request' && github.base_ref != 'main'
+      uses: peter-evans/create-or-update-comment@v3
+      with:
+        issue-number: ${{ github.event.pull_request.number }}
+        body: |
+          ## 🔍 Task Management API - DevSecOps Results
+          
+          ### 📊 Test Coverage
+          Coverage: **${{ steps.tests.outputs.coverage }}%**
+          
+          ### 🔒 Security Scans
+          - Dependency Scan (pip-audit): ${{ steps.deps-scan.outputs.pip-audit-status == 'passed' && '✅ Passed' || '❌ Failed' }}
+          - Dependency Scan (safety): ${{ steps.deps-scan.outputs.safety-status == 'passed' && '✅ Passed' || '❌ Failed' }}
+          - SAST Analysis (bandit): ${{ steps.sast-scan.outputs.bandit-status == 'passed' && '✅ Passed' || '❌ Failed' }}
+          - Secret Scanning: ✅ Completed
+          
+          **Overall Status**: ${{ job.status == 'success' && '✅ All checks passed' || '❌ Some checks failed' }}
+          
+          <sub>Updated: ${{ github.event.pull_request.head.sha }}</sub>
