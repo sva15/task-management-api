@@ -5,7 +5,5 @@ httpx
 bandit
 safety
 pip-audit
-flake8
-black
-isort
+ruff
 mypy
