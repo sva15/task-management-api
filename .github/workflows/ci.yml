@@ -1,0 +1,381 @@
+name: Task Management API - DevSecOps Pipeline
+
+on:
+  push:
+    branches: [ "feature/**", "develop" ]  # Only feature branches and develop
+  pull_request:
+    branches: [ "main", "develop" ]
+
+env:
+  PYTHON_VERSION: '3.11'
+  COVERAGE_THRESHOLD: '90'
+
+# Concurrency control: Cancel push events when PR exists for same branch
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'push' }}
+
+jobs:
+  code-quality:
+    name: Code Quality & Formatting
+    runs-on: ubuntu-latest
+    outputs:
+      ruff-lint-status: ${{ steps.ruff-lint.outcome }}
+      ruff-format-status: ${{ steps.ruff-format.outcome }}
+      typing-status: ${{ steps.typing.outcome }}
+    
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+        cache: 'pip'
+
+    - name: Install Dependencies
+      run: |
+        python -m pip install --upgrade pip
+        if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+        if [ -f requirements-dev.txt ]; then pip install -r requirements-dev.txt; fi
+
+    - name: Lint with Ruff
+      id: ruff-lint
+      continue-on-error: true
+      run: |
+        echo "::group::Ruff Linting & Import Sorting"
+        ruff check --output-format=github --target-version=py311 .
+        echo "::endgroup::"
+
+    - name: Check Formatting with Ruff
+      id: ruff-format
+      continue-on-error: true
+      run: |
+        echo "::group::Ruff Code Formatting Check"
+        ruff format --check --target-version=py311 .
+        echo "::endgroup::"
+
+    - name: Type Checking
+      id: typing
+      continue-on-error: true
+      run: |
+        echo "::group::MyPy Type Checking"
+        mypy . --ignore-missing-imports
+        echo "::endgroup::"
+
+    - name: Code Quality Summary
+      if: always()
+      run: |
+        echo "Code Quality Analysis Results" >> $GITHUB_STEP_SUMMARY
+        echo "============================" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "| Check | Status |" >> $GITHUB_STEP_SUMMARY
+        echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+        echo "| Ruff Linting | ${{ steps.ruff-lint.outcome == 'success' && 'PASSED' || 'FAILED' }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| Ruff Formatting | ${{ steps.ruff-format.outcome == 'success' && 'PASSED' || 'FAILED' }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| MyPy Type Analysis | ${{ steps.typing.outcome == 'success' && 'PASSED' || 'FAILED' }} |" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+
+  testing:
+    name: Testing & Coverage
+    runs-on: ubuntu-latest
+    needs: code-quality
+    outputs:
+      coverage-percentage: ${{ steps.coverage-summary.outputs.percentage }}
+      test-status: ${{ steps.run-tests.outcome }}
+    
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+        cache: 'pip'
+
+    - name: Install Dependencies
+      run: |
+        python -m pip install --upgrade pip
+        if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+        if [ -f requirements-dev.txt ]; then pip install -r requirements-dev.txt; fi
+
+    - name: Test with pytest
+      id: run-tests
+      run: |
+        echo "::group::Running Tests with Coverage"
+        mkdir -p junit
+        pytest tests/ --doctest-modules --junitxml=junit/test-results.xml --cov=src --cov-report=xml --cov-report=html -v
+        echo "::endgroup::"
+
+    - name: Test Results Report
+      uses: dorny/test-reporter@v1
+      if: always()
+      with:
+        name: pytest test results
+        path: junit/test-results.xml
+        reporter: java-junit
+        fail-on-error: false
+
+    - name: Generate Coverage Summary
+      id: coverage-summary
+      if: always()
+      run: |
+        # Extract coverage from pytest-cov XML report
+        if [ -f coverage.xml ]; then
+          TOTAL_COVERAGE=$(python -c "import xml.etree.ElementTree as ET; tree = ET.parse('coverage.xml'); root = tree.getroot(); coverage = root.attrib.get('line-rate', '0'); print(f'{float(coverage)*100:.1f}' if coverage != '0' else '0.0')")
+        else
+          TOTAL_COVERAGE="0.0"
+          echo "Warning: coverage.xml not found, setting to 0.0%"
+        fi
+        
+        echo "percentage=$TOTAL_COVERAGE" >> $GITHUB_OUTPUT
+        
+        # Parse test results from JUnit XML
+        if [ -f junit/test-results.xml ]; then
+          TEST_RESULTS=$(python -c "import xml.etree.ElementTree as ET; tree = ET.parse('junit/test-results.xml'); root = tree.getroot(); tests = int(root.attrib.get('tests', 0)); failures = int(root.attrib.get('failures', 0)); errors = int(root.attrib.get('errors', 0)); skipped = int(root.attrib.get('skipped', 0)); passed = tests - failures - errors - skipped; time = float(root.attrib.get('time', 0)); print(f'Tests: {tests} | Passed: {passed} | Failed: {failures} | Errors: {errors} | Skipped: {skipped} | Time: {time:.2f}s')" 2>/dev/null || echo "Unable to parse test results")
+        else
+          TEST_RESULTS="Test results not found"
+        fi
+
+        REPORT="Test & Coverage Report
+        ======================
+
+        Test Results: ${TEST_RESULTS}
+        Total Coverage: ${TOTAL_COVERAGE}%
+
+        Generated Reports:
+        - Test Results: junit/test-results.xml
+        - Coverage XML: coverage.xml
+        - Coverage HTML: htmlcov/"
+        
+        echo "report<<EOF" >> $GITHUB_OUTPUT
+        echo "$REPORT" >> $GITHUB_OUTPUT
+        echo "EOF" >> $GITHUB_OUTPUT
+
+    - name: Check Coverage Threshold
+      if: always()
+      run: |
+        COVERAGE="${{ steps.coverage-summary.outputs.percentage }}"
+        if awk "BEGIN {exit !($COVERAGE < ${{ env.COVERAGE_THRESHOLD }})}"; then
+          echo "Error: Coverage ${COVERAGE}% is below required ${{ env.COVERAGE_THRESHOLD }}% threshold"
+          exit 1
+        else
+          echo "Coverage ${COVERAGE}% meets required threshold"
+        fi
+
+    - name: Upload Coverage Reports
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: coverage-reports
+        path: |
+          coverage.xml
+          htmlcov/
+          junit/test-results.xml
+        retention-days: 7
+
+    - name: Testing Summary
+      if: always()
+      run: |
+        TEST_STATUS="${{ steps.run-tests.outcome }}"
+        COVERAGE="${{ steps.coverage-summary.outputs.percentage }}"
+        
+        echo "Testing Results" >> $GITHUB_STEP_SUMMARY
+        echo "===============" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
+        echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+        echo "| Test Execution | $([[ '$TEST_STATUS' == 'success' ]] && echo 'PASSED' || echo 'FAILED') |" >> $GITHUB_STEP_SUMMARY
+        echo "| Code Coverage | ${COVERAGE}% |" >> $GITHUB_STEP_SUMMARY
+        if awk "BEGIN {exit !($COVERAGE >= ${{ env.COVERAGE_THRESHOLD }})}"; then
+          COVERAGE_CHECK="PASSED"
+        else
+          COVERAGE_CHECK="FAILED"
+        fi
+        echo "| Coverage Threshold | ${COVERAGE_CHECK} (≥${{ env.COVERAGE_THRESHOLD }}%) |" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+
+  security-scans:
+    name: Security Analysis
+    runs-on: ubuntu-latest
+    outputs:
+      pip-audit-status: ${{ steps.deps-scan.outcome }}
+      sast-scan-status: ${{ steps.sast-scan.outcome }}
+      secret-scan-status: ${{ steps.secret-scan.outcome }}
+    
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+        cache: 'pip'
+
+    - name: Install Security Tools
+      run: |
+        python -m pip install --upgrade pip
+        pip install bandit
+
+    - name: Dependency Security Scan
+      continue-on-error: true
+      id: deps-scan
+      uses: pypa/gh-action-pip-audit@v1.1.0
+      with:
+        inputs: requirements.txt requirements-dev.txt
+
+    # - name: SAST Security Scan (Action)
+    #   id: sast-scan-action
+    #   continue-on-error: true
+    #   uses: PyCQA/bandit-action@v1
+    #   with:
+    #     targets: .
+    #     exclude: tests,__pycache__
+    #     severity: medium
+    #     confidence: medium
+
+    - name: SAST Security Scan
+      id: sast-scan
+      continue-on-error: true
+      run: |
+        echo "::group::Bandit Security Analysis"
+        bandit -r . --exclude tests,__pycache__ --severity-level medium --confidence-level medium --format json --output bandit-report.json || true
+        bandit -r . --exclude tests,__pycache__ --severity-level medium --confidence-level medium
+        echo "::endgroup::"
+
+    - name: Secret Scanning
+      id: secret-scan
+      continue-on-error: true
+      uses: gitleaks/gitleaks-action@v2
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Security Analysis Summary
+      if: always()
+      run: |
+        echo "Security Analysis Results" >> $GITHUB_STEP_SUMMARY
+        echo "========================" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "| Scan Type | Status |" >> $GITHUB_STEP_SUMMARY
+        echo "|-----------|--------|" >> $GITHUB_STEP_SUMMARY
+        echo "| Dependency Audit | ${{ steps.deps-scan.outcome == 'success' && 'PASSED' || 'FAILED' }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| SAST Analysis | ${{ steps.sast-scan.outcome == 'success' && 'PASSED' || 'FAILED' }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| Secret Detection | ${{ steps.secret-scan.outcome == 'success' && 'PASSED' || 'FAILED' }} |" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        
+        # Add Bandit report details if available
+        if [ -f bandit-report.json ]; then
+          echo "## Bandit Security Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Parse JSON report for summary
+          ISSUES_COUNT=$(python -c "import json; data = json.load(open('bandit-report.json')); print(len(data.get('results', [])))" 2>/dev/null || echo "0")
+          
+          if [ "$ISSUES_COUNT" -gt 0 ]; then
+            echo "**⚠️ Found $ISSUES_COUNT security issue(s)**" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "| Severity | Count |" >> $GITHUB_STEP_SUMMARY
+            echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+            
+            # Count by severity
+            HIGH_COUNT=$(python -c "import json; data = json.load(open('bandit-report.json')); results = data.get('results', []); print(sum(1 for r in results if r.get('issue_severity', '').lower() == 'high'))" 2>/dev/null || echo "0")
+            MEDIUM_COUNT=$(python -c "import json; data = json.load(open('bandit-report.json')); results = data.get('results', []); print(sum(1 for r in results if r.get('issue_severity', '').lower() == 'medium'))" 2>/dev/null || echo "0")
+            LOW_COUNT=$(python -c "import json; data = json.load(open('bandit-report.json')); results = data.get('results', []); print(sum(1 for r in results if r.get('issue_severity', '').lower() == 'low'))" 2>/dev/null || echo "0")
+            
+            echo "| High | $HIGH_COUNT |" >> $GITHUB_STEP_SUMMARY
+            echo "| Medium | $MEDIUM_COUNT |" >> $GITHUB_STEP_SUMMARY
+            echo "| Low | $LOW_COUNT |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "**✅ No security issues found**" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+        fi
+
+  sonarqube-analysis:
+    name: SonarQube Analysis
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || github.event.pull_request.base.ref == 'main'
+    needs: [testing]
+    continue-on-error: true
+    
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Download Coverage Reports
+      uses: actions/download-artifact@v4
+      with:
+        name: coverage-reports
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+
+    - name: SonarQube Analysis
+      uses: SonarSource/sonarqube-scan-action@v5.3.1
+      env:
+        SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+      with:
+        args: >
+          -Dsonar.python.coverage.reportPaths=coverage.xml
+          -Dsonar.sources=src
+          -Dsonar.tests=tests
+
+  pr-comment:
+    name: PR Comment with Results
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name == 'pull_request' &&
+      github.base_ref != 'main' &&  
+      always()
+    needs: [code-quality, testing, security-scans]
+    permissions:
+      pull-requests: write
+      contents: read
+    
+    steps:
+    - name: Comment PR with Results
+      uses: peter-evans/create-or-update-comment@v4
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+        issue-number: ${{ github.event.pull_request.number }}
+        body: |
+          Task Management API - DevSecOps Pipeline Results
+          ================================================
+
+          Test Coverage
+          -------------
+          | Metric | Value |
+          |--------|-------|
+          | Coverage Percentage | **${{ needs.testing.outputs.coverage-percentage }}%** |
+          | Coverage Status | ${{ needs.testing.outputs.test-status == 'success' && 'PASSED' || 'FAILED' }} |
+
+          Code Quality Analysis
+          --------------------
+          | Check | Status |
+          |-------|--------|
+          | Ruff Linting | ${{ needs.code-quality.outputs.ruff-lint-status == 'success' && 'PASSED' || 'FAILED' }} |
+          | Ruff Formatting | ${{ needs.code-quality.outputs.ruff-format-status == 'success' && 'PASSED' || 'FAILED' }} |
+          | Type Checking | ${{ needs.code-quality.outputs.typing-status == 'success' && 'PASSED' || 'FAILED' }} |
+
+          Security Analysis
+          -----------------
+          | Scan Type | Status |
+          |-----------|--------|
+          | Dependency Audit | ${{ needs.security-scans.outputs.pip-audit-status == 'success' && 'PASSED' || 'FAILED' }} |
+          | SAST Analysis | ${{ needs.security-scans.outputs.sast-scan-status == 'success' && 'PASSED' || 'FAILED' }} |
+          | Secret Detection | ${{ needs.security-scans.outputs.secret-scan-status == 'success' && 'PASSED' || 'FAILED' }} |
+
+          Build Details: [View Full Report](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
+
+          ---
+          Pipeline executed for commit: ${{ github.event.pull_request.head.sha }}
