@@ -20,7 +20,8 @@ jobs:
     name: Code Quality & Formatting
     runs-on: ubuntu-latest
     outputs:
-      formatting-status: ${{ steps.formatting.outcome }}
+      formatting-status: ${{ steps.black.outcome }}
+      isort-status: ${{ steps.isort.outcome }}
       linting-status: ${{ steps.linting.outcome }}
       typing-status: ${{ steps.typing.outcome }}
     
@@ -41,14 +42,18 @@ jobs:
         if [ -f requirements-dev.txt ]; then pip install -r requirements-dev.txt; fi
         pip install black isort flake8 mypy
 
-    - name: Code Formatting Check
-      id: formatting
+    - name: Black Formatting
+      id: black
       continue-on-error: true
       run: |
         echo "::group::Black Code Formatting"
         black --check --diff .
         echo "::endgroup::"
-        
+
+    - name: Import Sorting
+      id: isort
+      continue-on-error: true
+      run: |
         echo "::group::Import Sorting"
         isort --check-only --diff .
         echo "::endgroup::"
@@ -77,8 +82,8 @@ jobs:
         echo "" >> $GITHUB_STEP_SUMMARY
         echo "| Check | Status |" >> $GITHUB_STEP_SUMMARY
         echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
-        echo "| Black Formatting | ${{ steps.formatting.outcome == 'success' && 'PASSED' || 'FAILED' }} |" >> $GITHUB_STEP_SUMMARY
-        echo "| Import Sorting | ${{ steps.formatting.outcome == 'success' && 'PASSED' || 'FAILED' }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| Black Formatting | ${{ steps.black.outcome == 'success' && 'PASSED' || 'FAILED' }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| Import Sorting | ${{ steps.isort.outcome == 'success' && 'PASSED' || 'FAILED' }} |" >> $GITHUB_STEP_SUMMARY
         echo "| Flake8 Linting | ${{ steps.linting.outcome == 'success' && 'PASSED' || 'FAILED' }} |" >> $GITHUB_STEP_SUMMARY
         echo "| MyPy Type Analysis | ${{ steps.typing.outcome == 'success' && 'PASSED' || 'FAILED' }} |" >> $GITHUB_STEP_SUMMARY
         echo "" >> $GITHUB_STEP_SUMMARY
@@ -124,9 +129,12 @@ jobs:
       id: coverage-summary
       if: always()
       run: |
-        TOTAL_COVERAGE=$(python -m coverage report | grep TOTAL | awk '{print $4}' | sed 's/%//')
+        # Robust coverage extraction
+        COVERAGE_REPORT_OUTPUT=$(python -m coverage report || true)
+        TOTAL_COVERAGE=$(echo "$COVERAGE_REPORT_OUTPUT" | grep TOTAL | awk '{print $4}' | sed 's/%//')
         
         if [ -z "$TOTAL_COVERAGE" ] || [ "$TOTAL_COVERAGE" = "" ]; then
+          echo "$COVERAGE_REPORT_OUTPUT"
           TOTAL_COVERAGE="0.0"
           echo "Warning: Could not extract coverage, setting to 0.0%"
         fi
@@ -143,7 +151,8 @@ jobs:
         $(python -m coverage report --skip-covered --omit=\"*/tests/*\" | head -15)
         \`\`\`
 
-        Missing Lines: $(python -m coverage report --format=missing | wc -l) lines"
+        # If coverage report fails, output will be empty
+        Missing Lines: $(python -m coverage report --fail-under=0 | grep -c 'MISS') lines"
                 
                 echo "report<<EOF" >> $GITHUB_OUTPUT
                 echo "$REPORT" >> $GITHUB_OUTPUT
@@ -222,7 +231,7 @@ jobs:
         echo "::endgroup::"
         
         echo "::group::Safety Check"
-        safety check --json --output safety-report.json || true
+        safety check --output json > safety-report.json || true
         SAFETY_EXIT=$?
         echo "::endgroup::"
         
@@ -339,7 +348,8 @@ jobs:
           --------------------
           | Check | Status |
           |-------|--------|
-          | Code Formatting | ${{ needs.code-quality.outputs.formatting-status == 'success' && 'PASSED' || 'FAILED' }} |
+          | Black Formatting | ${{ needs.code-quality.outputs.formatting-status == 'success' && 'PASSED' || 'FAILED' }} |
+          | Import Sorting | ${{ needs.code-quality.outputs.isort-status == 'success' && 'PASSED' || 'FAILED' }} |
           | Code Linting | ${{ needs.code-quality.outputs.linting-status == 'success' && 'PASSED' || 'FAILED' }} |
           | Type Checking | ${{ needs.code-quality.outputs.typing-status == 'success' && 'PASSED' || 'FAILED' }} |
 
