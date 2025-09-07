@@ -52,8 +52,8 @@ jobs:
       id: ruff-format
       continue-on-error: true
       run: |
-        echo "::group::Ruff Code Formatting"
-        ruff format --diff --target-version=py311 .
+        echo "::group::Ruff Code Formatting Check"
+        ruff format --check --target-version=py311 .
         echo "::endgroup::"
 
     - name: Type Checking
