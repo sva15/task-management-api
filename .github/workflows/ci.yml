@@ -202,7 +202,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       pip-audit-status: ${{ steps.deps-scan.outcome }}
-      bandit-status: ${{ steps.sast-scan.outcome }}
+      sast-scan-status: ${{ steps.sast-scan.outcome }}
       secret-scan-status: ${{ steps.secret-scan.outcome }}
     
     steps:
@@ -224,15 +224,24 @@ jobs:
       with:
         inputs: requirements.txt requirements-dev.txt
 
+    # - name: SAST Security Scan (Action)
+    #   id: sast-scan-action
+    #   continue-on-error: true
+    #   uses: PyCQA/bandit-action@v1
+    #   with:
+    #     targets: .
+    #     exclude: tests,__pycache__
+    #     severity: medium
+    #     confidence: medium
+
     - name: SAST Security Scan
       id: sast-scan
       continue-on-error: true
-      uses: PyCQA/bandit-action@v1
-      with:
-        targets: .
-        exclude: tests,__pycache__
-        severity: medium
-        confidence: medium
+      run: |
+        echo "::group::Bandit Security Analysis"
+        bandit -r . --exclude tests,__pycache__ --severity-level medium --confidence-level medium --format json --output bandit-report.json || true
+        bandit -r . --exclude tests,__pycache__ --severity-level medium --confidence-level medium
+        echo "::endgroup::"
 
     - name: Secret Scanning
       id: secret-scan
@@ -253,6 +262,34 @@ jobs:
         echo "| SAST Analysis | ${{ steps.sast-scan.outcome == 'success' && 'PASSED' || 'FAILED' }} |" >> $GITHUB_STEP_SUMMARY
         echo "| Secret Detection | ${{ steps.secret-scan.outcome == 'success' && 'PASSED' || 'FAILED' }} |" >> $GITHUB_STEP_SUMMARY
         echo "" >> $GITHUB_STEP_SUMMARY
+        
+        # Add Bandit report details if available
+        if [ -f bandit-report.json ]; then
+          echo "## Bandit Security Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Parse JSON report for summary
+          ISSUES_COUNT=$(python -c "import json; data = json.load(open('bandit-report.json')); print(len(data.get('results', [])))" 2>/dev/null || echo "0")
+          
+          if [ "$ISSUES_COUNT" -gt 0 ]; then
+            echo "**⚠️ Found $ISSUES_COUNT security issue(s)**" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "| Severity | Count |" >> $GITHUB_STEP_SUMMARY
+            echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+            
+            # Count by severity
+            HIGH_COUNT=$(python -c "import json; data = json.load(open('bandit-report.json')); results = data.get('results', []); print(sum(1 for r in results if r.get('issue_severity', '').lower() == 'high'))" 2>/dev/null || echo "0")
+            MEDIUM_COUNT=$(python -c "import json; data = json.load(open('bandit-report.json')); results = data.get('results', []); print(sum(1 for r in results if r.get('issue_severity', '').lower() == 'medium'))" 2>/dev/null || echo "0")
+            LOW_COUNT=$(python -c "import json; data = json.load(open('bandit-report.json')); results = data.get('results', []); print(sum(1 for r in results if r.get('issue_severity', '').lower() == 'low'))" 2>/dev/null || echo "0")
+            
+            echo "| High | $HIGH_COUNT |" >> $GITHUB_STEP_SUMMARY
+            echo "| Medium | $MEDIUM_COUNT |" >> $GITHUB_STEP_SUMMARY
+            echo "| Low | $LOW_COUNT |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "**✅ No security issues found**" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+        fi
 
   sonarqube-analysis:
     name: SonarQube Analysis
@@ -330,7 +367,7 @@ jobs:
           | Scan Type | Status |
           |-----------|--------|
           | Dependency Audit | ${{ needs.security-scans.outputs.pip-audit-status == 'success' && 'PASSED' || 'FAILED' }} |
-          | SAST Analysis | ${{ needs.security-scans.outputs.bandit-status == 'success' && 'PASSED' || 'FAILED' }} |
+          | SAST Analysis | ${{ needs.security-scans.outputs.sast-scan-status == 'success' && 'PASSED' || 'FAILED' }} |
           | Secret Detection | ${{ needs.security-scans.outputs.secret-scan-status == 'success' && 'PASSED' || 'FAILED' }} |
 
           Build Details: [View Full Report](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
